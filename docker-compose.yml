@@ -1,0 +1,125 @@
+# CTI panel - phase 1: RSSHub (collector) + Miniflux (panel)
+# No accounts needed: public Telegram channels, Reddit, Bluesky, Mastodon, GitHub, news RSS.
+#
+# Isolation from other containers on this host:
+#   - own project name (cti-panel), own container names and hostnames (cti-*)
+#   - own networks: cti-internal (no internet) and cti-egress (internet for fetchers only)
+#   - own named volume, ports bound to 127.0.0.1 and set in .env
+#
+# Usage:  docker compose up -d   ->  open http://127.0.0.1:${MINIFLUX_PORT}
+# In Miniflux, subscribe to RSSHub feeds as:  http://cti-rsshub:1200/<route>
+
+name: cti-panel
+
+services:
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: cti-rsshub
+    hostname: cti-rsshub
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: redis
+      REDIS_URL: redis://cti-redis:6379/
+      CACHE_EXPIRE: 600            # seconds a feed stays cached
+      CACHE_CONTENT_EXPIRE: 3600
+      # Enables /rsshub/transform/* (turn any web page into a feed).
+      # Safe here: RSSHub is bound to 127.0.0.1 and only Miniflux can reach it.
+      ALLOW_USER_SUPPLY_UNSAFE_DOMAIN: "true"
+      # PROXY_URI: socks5h://host:port   # only if the VPS cannot reach t.me directly
+    ports:
+      - "127.0.0.1:${RSSHUB_PORT}:1200"   # local only, for testing routes in a browser
+    networks:
+      - cti-internal
+      - cti-egress                 # needs internet to fetch Telegram, Reddit, etc.
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: cti-redis
+    hostname: cti-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # pure cache, no disk writes
+    networks:
+      - cti-internal               # no internet access
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+
+  db:
+    image: postgres:17-alpine
+    container_name: cti-db
+    hostname: cti-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: miniflux
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: miniflux
+    volumes:
+      - miniflux-db:/var/lib/postgresql/data
+    networks:
+      - cti-internal               # no internet access, no published port
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "miniflux", "-d", "miniflux"]
+      interval: 10s
+      retries: 5
+
+  miniflux:
+    image: miniflux/miniflux:latest
+    container_name: cti-miniflux
+    hostname: cti-miniflux
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://miniflux:${DB_PASSWORD}@cti-db/miniflux?sslmode=disable
+      RUN_MIGRATIONS: 1
+      CREATE_ADMIN: 1
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      # Required since Miniflux 2.2.18 to fetch from cti-rsshub (private network)
+      FETCHER_ALLOW_PRIVATE_NETWORKS: 1
+      POLLING_FREQUENCY: 15                    # minutes
+      SCHEDULER_ROUND_ROBIN_MIN_INTERVAL: 15   # minutes
+      BATCH_SIZE: 100
+      # BASE_URL: https://intel.example.com    # set when behind a reverse proxy
+    ports:
+      - "127.0.0.1:${MINIFLUX_PORT}:8080"      # reverse proxy (TLS) in front for remote access
+    networks:
+      - cti-internal
+      - cti-egress                 # needs internet for news RSS and Telegram bot alerts
+    depends_on:
+      db:
+        condition: service_healthy
+      rsshub:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/usr/bin/miniflux", "-healthcheck", "auto"]
+      interval: 30s
+      retries: 3
+
+  reactflux:
+    # Modern web frontend for Miniflux. Static app: your browser talks to the
+    # Miniflux API directly, so log in with the Miniflux URL your browser can reach.
+    image: electh/reactflux:latest
+    container_name: cti-reactflux
+    hostname: cti-reactflux
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${REACTFLUX_PORT}:2000"
+    networks:
+      - cti-egress                 # published ports do not work on internal-only networks
+    depends_on:
+      - miniflux
+
+networks:
+  cti-internal:
+    name: cti-internal
+    internal: true                 # containers here cannot reach the internet
+  cti-egress:
+    name: cti-egress
+
+volumes:
+  miniflux-db:
+    name: cti-miniflux-db
